@@ -1,30 +1,25 @@
 import tensorflow as tf
-import input_data
-from utils import batch_index_groups
+from utils import batch_index_groups, dtype
 
-dtype = tf.float64
-
-class vae():
-    def __init__(self):
-        self.mnist, _, _, _, _, _ = input_data.prepare_MNIST_data("MNIST_data/")
+class vae(object):
+    def __init__(self, y_input, dim_img, dim_z, num_hidden):
         
-        self.n_hidden = 500
-        
-        self.n_epoch = 100
+        self.n_hidden = num_hidden
         self.keep_prob = 0.9
+        learn_rate = 1e-3
 
-        self.image = tf.placeholder(dtype, [None, 784])
-        mean, stddev = self.encoder(self.image, 2)
+        mean, stddev = self.encoder(y_input, dim_z)
 
         samples = mean + stddev * tf.random_normal(tf.shape(mean), 0, 1, dtype = dtype)
         epsilon = 1e-6
-        y_output = tf.clip_by_value(t=self.decoder(samples, 28 ** 2),
+        y_output = tf.clip_by_value(t=self.decoder(samples, dim_img),
                         clip_value_min=epsilon,
                         clip_value_max=1 - epsilon
                         )
-        self.elbo = self.loss(mean, stddev, y_output, self.image)
-
-        self.opt = tf.train.AdamOptimizer(0.001).minimize(self.elbo)
+        neg_log_likeli, kl = self.loss(mean, stddev, y_output, y_input)
+        self.neg_marginal_likelihood =neg_log_likeli
+        self.kl_divergence = kl
+        self.loss = kl + neg_log_likeli
 
         
     # Gaussian MLP
@@ -86,34 +81,12 @@ class vae():
 
     def loss(self, mean, stddev, y_output, y_output_true):
         # bernoulli log likelihood
-        log_likeli = tf.reduce_mean(tf.reduce_sum(y_output_true * tf.log(y_output) + (1 - y_output_true) * tf.log(1-y_output)))
+        log_likeli = tf.reduce_mean(tf.reduce_sum(y_output_true * tf.log(y_output) + (1 - y_output_true) * tf.log(1-y_output), axis = 1))
+        
     
         # Kl
         std_squared = tf.square(stddev)
         mea_squared = tf.square(mean)
-        kl = tf.reduce_mean(1/2 * tf.reduce_sum( tf.log(std_squared) + mea_squared + std_squared - 1))
+        kl = tf.reduce_mean(1/2 * tf.reduce_sum( tf.log(std_squared) + mea_squared + std_squared - 1, axis = 1))
    
-        return (kl-log_likeli)
-
-
-    def train(self):
-        s_batch = 128
-        train_size = 10000
-        y_train = self.mnist[:train_size, :-input_data.NUM_LABELS]
-        with tf.Session() as sess:
-            sess.run(tf.global_variables_initializer())
-            for epoch in range(self.n_epoch):
-                for i, batch_indices in enumerate(batch_index_groups(batch_size=s_batch, num_samples=train_size)):
-                    batch_input = y_train[batch_indices, :]
-                    _, tot_loss = sess.run((self.opt, self.elbo), 
-                            feed_dict={self.image : batch_input})
-                    if (i % 1 == 0):
-                        print(
-                            "epoch %d: L_tot %03.2f"  % (
-                            epoch,
-                            tot_loss
-                            )
-                        )
-
-model = vae()
-model.train()
+        return - log_likeli, kl
