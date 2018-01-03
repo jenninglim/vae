@@ -1,162 +1,141 @@
-"""Functions for downloading and reading MNIST data."""
+# Some code was borrowed from https://github.com/petewarden/tensorflow_makefile/blob/master/tensorflow/models/image/mnist/convolutional.py
+
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 import gzip
 import os
-import urllib
+
 import numpy
+from scipy import ndimage
+
+from six.moves import urllib
+
+import tensorflow as tf
+
 SOURCE_URL = 'http://yann.lecun.com/exdb/mnist/'
+DATA_DIRECTORY = "data"
 
+# Params for MNIST
+IMAGE_SIZE = 28
+NUM_CHANNELS = 1
+PIXEL_DEPTH = 255
+NUM_LABELS = 10
+VALIDATION_SIZE = 5000  # Size of the validation set.
 
-def maybe_download(filename, work_directory):
+# Download MNIST data
+def maybe_download(filename):
     """Download the data from Yann's website, unless it's already here."""
-    if not os.path.exists(work_directory):
-        os.mkdir(work_directory)
-    filepath = os.path.join(work_directory, filename)
-    if not os.path.exists(filepath):
-        filepath, _ = urllib.urlretrieve(SOURCE_URL + filename, filepath)
-        statinfo = os.stat(filepath)
-        print 'Succesfully downloaded', filename, statinfo.st_size, 'bytes.'
+    if not tf.gfile.Exists(DATA_DIRECTORY):
+        tf.gfile.MakeDirs(DATA_DIRECTORY)
+    filepath = os.path.join(DATA_DIRECTORY, filename)
+    if not tf.gfile.Exists(filepath):
+        filepath, _ = urllib.request.urlretrieve(SOURCE_URL + filename, filepath)
+        with tf.gfile.GFile(filepath) as f:
+            size = f.size()
+        print('Successfully downloaded', filename, size, 'bytes.')
     return filepath
 
-
-def _read32(bytestream):
-    dt = numpy.dtype(numpy.uint32).newbyteorder('>')
-    return numpy.frombuffer(bytestream.read(4), dtype=dt)
-
-
-def extract_images(filename):
-    """Extract the images into a 4D uint8 numpy array [index, y, x, depth]."""
-    print 'Extracting', filename
+# Extract the images
+def extract_data(filename, num_images, norm_shift=False, norm_scale=True):
+    """Extract the images into a 4D tensor [image index, y, x, channels].
+    Values are rescaled from [0, 255] down to [-0.5, 0.5].
+    """
+    print('Extracting', filename)
     with gzip.open(filename) as bytestream:
-        magic = _read32(bytestream)
-        if magic != 2051:
-            raise ValueError(
-                'Invalid magic number %d in MNIST image file: %s' %
-                (magic, filename))
-        num_images = _read32(bytestream)
-        rows = _read32(bytestream)
-        cols = _read32(bytestream)
-        buf = bytestream.read(rows * cols * num_images)
-        data = numpy.frombuffer(buf, dtype=numpy.uint8)
-        data = data.reshape(num_images, rows, cols, 1)
-        return data
+        bytestream.read(16)
+        buf = bytestream.read(IMAGE_SIZE * IMAGE_SIZE * num_images * NUM_CHANNELS)
+        data = numpy.frombuffer(buf, dtype=numpy.uint8).astype(numpy.float32)
+        if norm_shift:
+            data = data - (PIXEL_DEPTH / 2.0)
+        if norm_scale:
+            data = data / PIXEL_DEPTH
+        data = data.reshape(num_images, IMAGE_SIZE, IMAGE_SIZE, NUM_CHANNELS)
+        data = numpy.reshape(data, [num_images, -1])
+    return data
 
-
-def dense_to_one_hot(labels_dense, num_classes=10):
-    """Convert class labels from scalars to one-hot vectors."""
-    num_labels = labels_dense.shape[0]
-    index_offset = numpy.arange(num_labels) * num_classes
-    labels_one_hot = numpy.zeros((num_labels, num_classes))
-    labels_one_hot.flat[index_offset + labels_dense.ravel()] = 1
-    return labels_one_hot
-
-
-def extract_labels(filename, one_hot=False):
-    """Extract the labels into a 1D uint8 numpy array [index]."""
-    print 'Extracting', filename
+# Extract the labels
+def extract_labels(filename, num_images):
+    """Extract the labels into a vector of int64 label IDs."""
+    print('Extracting', filename)
     with gzip.open(filename) as bytestream:
-        magic = _read32(bytestream)
-        if magic != 2049:
-            raise ValueError(
-                'Invalid magic number %d in MNIST label file: %s' %
-                (magic, filename))
-        num_items = _read32(bytestream)
-        buf = bytestream.read(num_items)
-        labels = numpy.frombuffer(buf, dtype=numpy.uint8)
-        if one_hot:
-            return dense_to_one_hot(labels)
-        return labels
+        bytestream.read(8)
+        buf = bytestream.read(1 * num_images)
+        labels = numpy.frombuffer(buf, dtype=numpy.uint8).astype(numpy.int64)
+        num_labels_data = len(labels)
+        one_hot_encoding = numpy.zeros((num_labels_data,NUM_LABELS))
+        one_hot_encoding[numpy.arange(num_labels_data),labels] = 1
+        one_hot_encoding = numpy.reshape(one_hot_encoding, [-1, NUM_LABELS])
+    return one_hot_encoding
 
+# Augment training data
+def expend_training_data(images, labels):
 
-class DataSet(object):
-    def __init__(self, images, labels, fake_data=False):
-        if fake_data:
-            self._num_examples = 10000
-        else:
-            assert images.shape[0] == labels.shape[0], (
-                "images.shape: %s labels.shape: %s" % (images.shape,
-                                                       labels.shape))
-            self._num_examples = images.shape[0]
-            # Convert shape from [num examples, rows, columns, depth]
-            # to [num examples, rows*columns] (assuming depth == 1)
-            assert images.shape[3] == 1
-            images = images.reshape(images.shape[0],
-                                    images.shape[1] * images.shape[2])
-            # Convert from [0, 255] -> [0.0, 1.0].
-            images = images.astype(numpy.float32)
-            images = numpy.multiply(images, 1.0 / 255.0)
-        self._images = images
-        self._labels = labels
-        self._epochs_completed = 0
-        self._index_in_epoch = 0
+    expanded_images = []
+    expanded_labels = []
 
-    @property
-    def images(self):
-        return self._images
+    j = 0 # counter
+    for x, y in zip(images, labels):
+        j = j+1
+        if j%100==0:
+            print ('expanding data : %03d / %03d' % (j,numpy.size(images,0)))
 
-    @property
-    def labels(self):
-        return self._labels
+        # register original data
+        expanded_images.append(x)
+        expanded_labels.append(y)
 
-    @property
-    def num_examples(self):
-        return self._num_examples
+        # get a value for the background
+        # zero is the expected value, but median() is used to estimate background's value
+        bg_value = numpy.median(x) # this is regarded as background's value
+        image = numpy.reshape(x, (-1, 28))
 
-    @property
-    def epochs_completed(self):
-        return self._epochs_completed
+        for i in range(4):
+            # rotate the image with random degree
+            angle = numpy.random.randint(-15,15,1)
+            new_img = ndimage.rotate(image,angle,reshape=False, cval=bg_value)
 
-    def next_batch(self, batch_size, fake_data=False):
-        """Return the next `batch_size` examples from this data set."""
-        if fake_data:
-            fake_image = [1.0 for _ in xrange(784)]
-            fake_label = 0
-            return [fake_image for _ in xrange(batch_size)], [
-                fake_label for _ in xrange(batch_size)]
-        start = self._index_in_epoch
-        self._index_in_epoch += batch_size
-        if self._index_in_epoch > self._num_examples:
-            # Finished epoch
-            self._epochs_completed += 1
-            # Shuffle the data
-            perm = numpy.arange(self._num_examples)
-            numpy.random.shuffle(perm)
-            self._images = self._images[perm]
-            self._labels = self._labels[perm]
-            # Start next epoch
-            start = 0
-            self._index_in_epoch = batch_size
-            assert batch_size <= self._num_examples
-        end = self._index_in_epoch
-        return self._images[start:end], self._labels[start:end]
+            # shift the image with random distance
+            shift = numpy.random.randint(-2, 2, 2)
+            new_img_ = ndimage.shift(new_img,shift, cval=bg_value)
 
+            # register new training data
+            expanded_images.append(numpy.reshape(new_img_, 784))
+            expanded_labels.append(y)
 
-def read_data_sets(train_dir, fake_data=False, one_hot=False):
-    class DataSets(object):
-        pass
-    data_sets = DataSets()
-    if fake_data:
-        data_sets.train = DataSet([], [], fake_data=True)
-        data_sets.validation = DataSet([], [], fake_data=True)
-        data_sets.test = DataSet([], [], fake_data=True)
-        return data_sets
-    TRAIN_IMAGES = 'train-images-idx3-ubyte.gz'
-    TRAIN_LABELS = 'train-labels-idx1-ubyte.gz'
-    TEST_IMAGES = 't10k-images-idx3-ubyte.gz'
-    TEST_LABELS = 't10k-labels-idx1-ubyte.gz'
-    VALIDATION_SIZE = 5000
-    local_file = maybe_download(TRAIN_IMAGES, train_dir)
-    train_images = extract_images(local_file)
-    local_file = maybe_download(TRAIN_LABELS, train_dir)
-    train_labels = extract_labels(local_file, one_hot=one_hot)
-    local_file = maybe_download(TEST_IMAGES, train_dir)
-    test_images = extract_images(local_file)
-    local_file = maybe_download(TEST_LABELS, train_dir)
-    test_labels = extract_labels(local_file, one_hot=one_hot)
-    validation_images = train_images[:VALIDATION_SIZE]
-    validation_labels = train_labels[:VALIDATION_SIZE]
-    train_images = train_images[VALIDATION_SIZE:]
-    train_labels = train_labels[VALIDATION_SIZE:]
-    data_sets.train = DataSet(train_images, train_labels)
-    data_sets.validation = DataSet(validation_images, validation_labels)
-    data_sets.test = DataSet(test_images, test_labels)
-    return data_sets
+    # images and labels are concatenated for random-shuffle at each epoch
+    # notice that pair of image and label should not be broken
+    expanded_train_total_data = numpy.concatenate((expanded_images, expanded_labels), axis=1)
+    numpy.random.shuffle(expanded_train_total_data)
+
+    return expanded_train_total_data
+
+# Prepare MNISt data
+def prepare_MNIST_data(use_norm_shift=False, use_norm_scale=True, use_data_augmentation=False):
+    # Get the data.
+    train_data_filename = maybe_download('train-images-idx3-ubyte.gz')
+    train_labels_filename = maybe_download('train-labels-idx1-ubyte.gz')
+    test_data_filename = maybe_download('t10k-images-idx3-ubyte.gz')
+    test_labels_filename = maybe_download('t10k-labels-idx1-ubyte.gz')
+
+    # Extract it into numpy arrays.
+    train_data = extract_data(train_data_filename, 60000, use_norm_shift, use_norm_scale)
+    train_labels = extract_labels(train_labels_filename, 60000)
+    test_data = extract_data(test_data_filename, 10000, use_norm_shift, use_norm_scale)
+    test_labels = extract_labels(test_labels_filename, 10000)
+
+    # Generate a validation set.
+    validation_data = train_data[:VALIDATION_SIZE, :]
+    validation_labels = train_labels[:VALIDATION_SIZE,:]
+    train_data = train_data[VALIDATION_SIZE:, :]
+    train_labels = train_labels[VALIDATION_SIZE:,:]
+
+    # Concatenate train_data & train_labels for random shuffle
+    if use_data_augmentation:
+        train_total_data = expend_training_data(train_data, train_labels)
+    else:
+        train_total_data = numpy.concatenate((train_data, train_labels), axis=1)
+
+    train_size = train_total_data.shape[0]
+
+    return train_total_data, train_size, validation_data, validation_labels, test_data, test_labels
